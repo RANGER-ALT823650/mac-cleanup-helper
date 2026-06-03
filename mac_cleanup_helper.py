@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import fnmatch
 import os
 import re
@@ -38,6 +39,8 @@ TCC_PROTECTED: set[str] = {
 class Candidate:
     path: Path
     size_bytes: int
+    label: str | None = None
+    delete_command: Sequence[str] | None = None
 
 
 @dataclass
@@ -166,6 +169,131 @@ def collect_backup_directories(directory: Path, older_than_days: int) -> List[Ca
     return candidates
 
 
+def run_command(command: Sequence[str], timeout: int = 120) -> subprocess.CompletedProcess[str] | None:
+    try:
+        return subprocess.run(
+            list(command),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError, OSError):
+        return None
+
+
+def command_output(command: Sequence[str], timeout: int = 120) -> str:
+    result = run_command(command, timeout=timeout)
+    if result is None or result.returncode != 0:
+        return ""
+    return result.stdout
+
+
+def candidate_display(candidate: Candidate) -> str:
+    return candidate.label or str(candidate.path)
+
+
+def candidate_name(candidate: Candidate) -> str:
+    return candidate.label or candidate.path.name
+
+
+def collect_codex_code_sign_clones() -> List[Candidate]:
+    candidates: List[Candidate] = []
+    for cache_root in Path("/private/var/folders").glob("*/*/X/com.openai.codex.code_sign_clone"):
+        candidates.extend(collect_children(cache_root))
+    return candidates
+
+
+def collect_core_simulator_dyld_cache() -> List[Candidate]:
+    path = Path("/Library/Developer/CoreSimulator/Caches/dyld")
+    size = path_size(path)
+    if size <= 0:
+        return []
+    return [
+        Candidate(
+            path=path,
+            size_bytes=size,
+            label="全部 Simulator dyld shared cache",
+            delete_command=["xcrun", "simctl", "runtime", "dyld_shared_cache", "remove", "--all"],
+        )
+    ]
+
+
+def collect_unavailable_simulator_devices() -> List[Candidate]:
+    raw = command_output(["xcrun", "simctl", "list", "devices", "-j"])
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+
+    candidates: List[Candidate] = []
+    devices_root = HOME / "Library" / "Developer" / "CoreSimulator" / "Devices"
+    for runtime, devices in data.get("devices", {}).items():
+        for device in devices:
+            if device.get("isAvailable", True):
+                continue
+            udid = device.get("udid")
+            name = device.get("name", "Unknown Simulator")
+            if not udid:
+                continue
+            path = devices_root / udid
+            size = path_size(path)
+            candidates.append(
+                Candidate(
+                    path=path,
+                    size_bytes=size,
+                    label=f"{name} ({runtime})",
+                    delete_command=["xcrun", "simctl", "delete", udid],
+                )
+            )
+    return candidates
+
+
+def collect_old_simulator_runtimes(not_used_days: int = 30) -> List[Candidate]:
+    runtime_raw = command_output(["xcrun", "simctl", "runtime", "list", "-j"])
+    dry_run_raw = command_output(
+        ["xcrun", "simctl", "runtime", "delete", "--notUsedSinceDays", str(not_used_days), "--dry-run"]
+    )
+    if not runtime_raw or not dry_run_raw:
+        return []
+
+    try:
+        runtime_data = json.loads(runtime_raw)
+    except json.JSONDecodeError:
+        return []
+
+    runtime_sizes: dict[str, int] = {}
+    runtime_labels: dict[str, str] = {}
+    for identifier, runtime in runtime_data.items():
+        if not isinstance(runtime, dict):
+            continue
+        version = runtime.get("version", "?")
+        build = runtime.get("build", "?")
+        runtime_identifier = runtime.get("runtimeIdentifier", "")
+        platform = runtime_identifier.rsplit(".", 1)[-1].split("-", 1)[0] or "Simulator"
+        runtime_sizes[identifier] = int(runtime.get("sizeBytes") or 0)
+        runtime_labels[identifier] = f"{platform} {version} ({build})"
+
+    candidates: List[Candidate] = []
+    for line in dry_run_raw.splitlines():
+        match = re.search(r"Would delete \S+:\s+([0-9A-F-]{36})\s+(.+)$", line)
+        if not match:
+            continue
+        identifier = match.group(1)
+        label = runtime_labels.get(identifier, match.group(2).strip())
+        candidates.append(
+            Candidate(
+                path=Path(identifier),
+                size_bytes=runtime_sizes.get(identifier, 0),
+                label=f"{label} runtime",
+                delete_command=["xcrun", "simctl", "runtime", "delete", identifier],
+            )
+        )
+    return candidates
+
+
 def delete_path(path: Path) -> None:
     if not path.exists() and not path.is_symlink():
         return
@@ -175,6 +303,15 @@ def delete_path(path: Path) -> None:
         path.unlink(missing_ok=True)
         return
     shutil.rmtree(path)
+
+
+def delete_candidate(candidate: Candidate) -> None:
+    if candidate.delete_command:
+        result = subprocess.run(list(candidate.delete_command), text=True, check=False)
+        if result.returncode != 0:
+            raise RuntimeError(f"命令退出码 {result.returncode}: {' '.join(candidate.delete_command)}")
+        return
+    delete_path(candidate.path)
 
 
 def top_candidates(candidates: Sequence[Candidate], limit: int = 8) -> List[Candidate]:
@@ -246,6 +383,22 @@ def build_items() -> List[CleanupItem]:
             scanner=lambda: collect_children(HOME / "Library" / "Developer" / "CoreSimulator" / "Caches"),
         ),
         CleanupItem(
+            key="core_simulator_dyld_cache",
+            level=2,
+            title="Simulator dyld 缓存",
+            description="通过 simctl 清理所有 Simulator runtime 的 dyld shared cache。",
+            caution="安全性较高，但下次启动/运行模拟器时会按需重建；可能需要 Xcode 命令行工具可用。",
+            scanner=collect_core_simulator_dyld_cache,
+        ),
+        CleanupItem(
+            key="unavailable_simulator_devices",
+            level=2,
+            title="不可用模拟器设备",
+            description="清理 simctl 标记为不可用的模拟器设备数据。",
+            caution="只删除不可用设备；如果以后需要旧 runtime，可重新下载 runtime 后再创建设备。",
+            scanner=collect_unavailable_simulator_devices,
+        ),
+        CleanupItem(
             key="package_manager_caches",
             level=2,
             title="开发工具缓存",
@@ -277,6 +430,34 @@ def build_items() -> List[CleanupItem]:
             description="清理 Codex / XcodeBuildMCP 的派生构建缓存。",
             caution="只影响后续重新构建速度。",
             scanner=lambda: collect_children(HOME / "Library" / "Developer" / "XcodeBuildMCP" / "workspaces"),
+        ),
+        CleanupItem(
+            key="xctest_devices",
+            level=2,
+            title="XCTest 临时设备",
+            description="清理 Xcode/XCTest 生成的临时测试设备数据。",
+            caution="会删除旧 UI 测试设备状态；需要时 Xcode 会重新创建。",
+            scanner=lambda: [
+                candidate
+                for candidate in collect_children(HOME / "Library" / "Developer" / "XCTestDevices")
+                if candidate.path.is_dir()
+            ],
+        ),
+        CleanupItem(
+            key="codex_code_sign_clones",
+            level=3,
+            title="Codex 临时签名副本",
+            description="清理 Codex.app 在 /private/var/folders 下留下的 code_sign_clone 临时 App 副本。",
+            caution="建议先退出 Codex 再清理；如果 Codex 正在运行，跳过这一项更稳妥。",
+            scanner=collect_codex_code_sign_clones,
+        ),
+        CleanupItem(
+            key="old_simulator_runtimes",
+            level=3,
+            title="30天未使用的 Simulator runtime",
+            description="通过 simctl 删除 30 天未使用的可删除 Simulator runtime。",
+            caution="会删除旧 iOS/watchOS runtime；如果需要测试旧系统兼容，请逐项选择而不是全选。",
+            scanner=lambda: collect_old_simulator_runtimes(not_used_days=30),
         ),
         CleanupItem(
             key="downloads_installers",
@@ -377,7 +558,7 @@ def show_item_details(summary: Sequence[tuple[CleanupItem, List[Candidate], int]
             continue
         print(f"\n[{index:02d}] {item.title} - {human_size(total)}")
         for candidate in top_candidates(candidates):
-            print(f"  - {human_size(candidate.size_bytes):>9}  {candidate.path}")
+            print(f"  - {human_size(candidate.size_bytes):>9}  {candidate_display(candidate)}")
 
 
 def ask_yes_no(prompt: str, default: bool = False) -> bool:
@@ -419,7 +600,7 @@ def selective_delete(candidates: Sequence[Candidate]) -> tuple[int, int]:
 
     print(f"\n  共 {len(sorted_candidates)} 项。输入编号选择（如 1,3,5-7），a=全选，q=返回：")
     for i, c in enumerate(sorted_candidates, start=1):
-        print(f"    [{i:3d}]  {human_size(c.size_bytes):>9}  {c.path.name}")
+        print(f"    [{i:3d}]  {human_size(c.size_bytes):>9}  {candidate_name(c)}")
 
     while True:
         raw = input("  > ").strip().lower()
@@ -448,11 +629,11 @@ def selective_delete(candidates: Sequence[Candidate]) -> tuple[int, int]:
     for candidate in selected:
         try:
             size = candidate.size_bytes
-            delete_path(candidate.path)
+            delete_candidate(candidate)
             removed_count += 1
             removed_bytes += size
         except Exception as exc:
-            print(f"  ! 删除失败: {candidate.path} -> {exc}")
+            print(f"  ! 删除失败: {candidate_display(candidate)} -> {exc}")
 
     return removed_count, removed_bytes
 
@@ -463,11 +644,11 @@ def delete_candidates(item: CleanupItem, candidates: Sequence[Candidate]) -> tup
     for candidate in candidates:
         try:
             size = candidate.size_bytes
-            delete_path(candidate.path)
+            delete_candidate(candidate)
             removed_count += 1
             removed_bytes += size
         except Exception as exc:  # noqa: BLE001
-            print(f"  ! 删除失败: {candidate.path} -> {exc}")
+            print(f"  ! 删除失败: {candidate_display(candidate)} -> {exc}")
     return removed_count, removed_bytes
 
 
@@ -483,7 +664,7 @@ def clean_selected(summary: Sequence[tuple[CleanupItem, List[Candidate], int]], 
         print(f"\n准备处理: {item.title}")
         print(f"预计可释放: {human_size(total)}，共 {len(candidates)} 项")
         for candidate in top_candidates(candidates, limit=5):
-            print(f"  - {human_size(candidate.size_bytes):>9}  {candidate.path}")
+            print(f"  - {human_size(candidate.size_bytes):>9}  {candidate_display(candidate)}")
 
         print(f"\n请选择操作: [y=全部清理 / s=逐项选择 / n=跳过]")
         skip_item = False
