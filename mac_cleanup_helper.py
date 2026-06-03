@@ -200,6 +200,20 @@ def build_items() -> List[CleanupItem]:
             scanner=lambda: collect_children(HOME / "Library" / "Logs"),
         ),
         CleanupItem(
+            key="quark_caches",
+            level=2,
+            title="夸克缓存",
+            description="清理夸克浏览器/网盘缓存，包括视频缓存和通用 Cache 目录。",
+            caution="只清理缓存内容，不删除账号、持久化数据库或下载文件；建议先退出夸克。",
+            scanner=lambda: sum(
+                [
+                    collect_children(HOME / "Library" / "Application Support" / "Quark" / "Cache"),
+                    collect_children(HOME / "Library" / "Application Support" / "Quark" / "Quark" / "Cache"),
+                ],
+                [],
+            ),
+        ),
+        CleanupItem(
             key="trash",
             level=1,
             title="废纸篓",
