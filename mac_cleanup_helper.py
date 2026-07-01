@@ -7,12 +7,13 @@ import fnmatch
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, List, Sequence
+from typing import Callable, Iterable, List, Optional, Sequence
 
 
 HOME = Path.home()
@@ -197,10 +198,11 @@ def candidate_name(candidate: Candidate) -> str:
     return candidate.label or candidate.path.name
 
 
-def collect_codex_code_sign_clones() -> List[Candidate]:
+def collect_code_sign_clones() -> List[Candidate]:
     candidates: List[Candidate] = []
-    for cache_root in Path("/private/var/folders").glob("*/*/X/com.openai.codex.code_sign_clone"):
-        candidates.extend(collect_children(cache_root))
+    for cache_root in Path("/private/var/folders").glob("*/*/X/*code_sign_clone*"):
+        if cache_root.is_dir():
+            candidates.extend(collect_children(cache_root))
     return candidates
 
 
@@ -294,15 +296,197 @@ def collect_old_simulator_runtimes(not_used_days: int = 30) -> List[Candidate]:
     return candidates
 
 
+def collect_container_caches(root_dir: Path) -> List[Candidate]:
+    candidates: List[Candidate] = []
+    if not root_dir.exists():
+        return candidates
+    for entry in safe_scandir(root_dir):
+        container_path = Path(entry.path)
+        data_dir = container_path / "Data"
+        if data_dir.exists():
+            caches_dir = data_dir / "Library" / "Caches"
+            if caches_dir.exists():
+                size = path_size(caches_dir)
+                if size > 0:
+                    candidates.append(Candidate(
+                        path=caches_dir, 
+                        size_bytes=size, 
+                        label=f"沙盒应用缓存 ({container_path.name})"
+                    ))
+            tmp_dir = data_dir / "tmp"
+            if tmp_dir.exists():
+                size = path_size(tmp_dir)
+                if size > 0:
+                    candidates.append(Candidate(
+                        path=tmp_dir, 
+                        size_bytes=size, 
+                        label=f"沙盒临时文件 ({container_path.name})"
+                    ))
+    return candidates
+
+
+def collect_group_container_caches() -> List[Candidate]:
+    candidates: List[Candidate] = []
+    gc_root = HOME / "Library" / "Group Containers"
+    if not gc_root.exists():
+        return candidates
+    for entry in safe_scandir(gc_root):
+        path = Path(entry.path)
+        library_dir = path / "Library"
+        if library_dir.exists():
+            caches_dir = library_dir / "Caches"
+            if caches_dir.exists():
+                size = path_size(caches_dir)
+                if size > 0:
+                    candidates.append(Candidate(path=caches_dir, size_bytes=size, label=f"应用组缓存 ({path.name})"))
+            cache_dir = library_dir / "Cache"
+            if cache_dir.exists():
+                size = path_size(cache_dir)
+                if size > 0:
+                    candidates.append(Candidate(path=cache_dir, size_bytes=size, label=f"应用组缓存 ({path.name})"))
+        
+        # Specifically target Telegram media cache
+        if "Telegram" in path.name:
+            for acct_dir in path.glob("stable/account-*/postbox/media"):
+                if acct_dir.exists():
+                    size = path_size(acct_dir)
+                    if size > 0:
+                        candidates.append(Candidate(path=acct_dir, size_bytes=size, label=f"Telegram 媒体缓存 ({path.name})"))
+    return candidates
+
+
+def collect_dictionary_sources() -> List[Candidate]:
+    candidates: List[Candidate] = []
+    containers_root = HOME / "Library" / "Containers"
+    if not containers_root.exists():
+        return candidates
+    for entry in safe_scandir(containers_root):
+        container_path = Path(entry.path)
+        dicts_dir = container_path / "Data" / "Library" / "Application Support" / "dictionaries"
+        if dicts_dir.exists():
+            for imported_entry in safe_scandir(dicts_dir):
+                imported_path = Path(imported_entry.path)
+                source_dir = imported_path / "source"
+                if source_dir.exists():
+                    size = path_size(source_dir)
+                    if size > 0:
+                        candidates.append(Candidate(path=source_dir, size_bytes=size, label=f"词典源码备份 ({container_path.name})"))
+    return candidates
+
+
+def collect_app_support_caches() -> List[Candidate]:
+    candidates: List[Candidate] = []
+    app_support = HOME / "Library" / "Application Support"
+    if not app_support.exists():
+        return candidates
+    
+    cache_names = {
+        "cache", "caches", "cacheddata", "cachedextensionvsixs", 
+        "dawncache", "dawngraphitecache", "dawnwebgpucache", 
+        "gpucache", "code cache", "gpupersistentcache", "crx_cache",
+        "shadercache", "grshadercache", "graphitedawncache"
+    }
+    
+    for app_entry in safe_scandir(app_support):
+        app_path = Path(app_entry.path)
+        if not app_path.is_dir():
+            continue
+        
+        # Check level 1 subdirs (e.g. Application Support/AppName/Cache)
+        for entry_l1 in safe_scandir(app_path):
+            path_l1 = Path(entry_l1.path)
+            if path_l1.is_dir():
+                if path_l1.name.lower() in cache_names:
+                    size = path_size(path_l1)
+                    if size > 0:
+                        candidates.append(Candidate(path=path_l1, size_bytes=size, label=f"应用支持缓存 ({app_path.name}/{path_l1.name})"))
+                else:
+                    # Check level 2 subdirs (e.g. Application Support/AppName/ProfileName/Cache)
+                    for entry_l2 in safe_scandir(path_l1):
+                        path_l2 = Path(entry_l2.path)
+                        if path_l2.is_dir() and path_l2.name.lower() in cache_names:
+                            size = path_size(path_l2)
+                            if size > 0:
+                                candidates.append(Candidate(path=path_l2, size_bytes=size, label=f"应用支持缓存 ({app_path.name}/{path_l1.name}/{path_l2.name})"))
+    return candidates
+
+
+def collect_homebrew_cleanup() -> List[Candidate]:
+    candidates: List[Candidate] = []
+    if shutil.which("brew"):
+        raw = command_output(["brew", "cleanup", "-n"])
+        size_bytes = 0
+        lines = raw.splitlines()
+        for line in lines:
+            if "This operation would free approximately" in line:
+                match = re.search(r"approximately\s+([\d.]+)\s*([A-Za-z]+)", line)
+                if match:
+                    val = float(match.group(1))
+                    unit = match.group(2).upper()
+                    if "G" in unit:
+                        size_bytes = int(val * 1024 * 1024 * 1024)
+                    elif "M" in unit:
+                        size_bytes = int(val * 1024 * 1024)
+                    elif "K" in unit:
+                        size_bytes = int(val * 1024)
+        
+        if size_bytes > 0 or "Would remove" in raw:
+            candidates.append(Candidate(
+                path=Path("/opt/homebrew"),
+                size_bytes=max(size_bytes, 1024 * 1024),
+                label="Homebrew 缓存与旧版本软件",
+                delete_command=["brew", "cleanup", "-s"]
+            ))
+            
+        autoremove_raw = command_output(["brew", "autoremove", "-n"])
+        if "Would autoremove" in autoremove_raw:
+            formulas = []
+            for line in autoremove_raw.splitlines():
+                if line.startswith("  ") or (line.strip() and not line.startswith("Would") and not line.startswith("==")):
+                    formulas.extend(line.strip().split())
+            
+            autoremove_size = 0
+            cellar_root = Path("/opt/homebrew/Cellar")
+            if not cellar_root.exists():
+                cellar_root = Path("/usr/local/Cellar")
+            
+            for formula in formulas:
+                formula_path = cellar_root / formula
+                if formula_path.exists():
+                    autoremove_size += path_size(formula_path)
+            
+            if autoremove_size > 0:
+                candidates.append(Candidate(
+                    path=Path("/opt/homebrew/autoremove"),
+                    size_bytes=autoremove_size,
+                    label="Homebrew 孤立未使用的依赖软件包",
+                    delete_command=["brew", "autoremove"]
+                ))
+                
+    return candidates
+
+
 def delete_path(path: Path) -> None:
     if not path.exists() and not path.is_symlink():
         return
     if path.name in TCC_PROTECTED:
         return
     if path.is_symlink() or path.is_file():
-        path.unlink(missing_ok=True)
+        try:
+            path.unlink(missing_ok=True)
+        except PermissionError:
+            os.chmod(path, stat.S_IWRITE)
+            path.unlink(missing_ok=True)
         return
-    shutil.rmtree(path)
+        
+    def on_error(func, p, exc_info):
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+        except Exception:
+            pass
+
+    shutil.rmtree(path, onerror=on_error)
 
 
 def delete_candidate(candidate: Candidate) -> None:
@@ -339,13 +523,15 @@ def build_items() -> List[CleanupItem]:
         CleanupItem(
             key="quark_caches",
             level=2,
-            title="夸克缓存",
-            description="清理夸克浏览器/网盘缓存，包括视频缓存和通用 Cache 目录。",
-            caution="只清理缓存内容，不删除账号、持久化数据库或下载文件；建议先退出夸克。",
+            title="夸克缓存及残留",
+            description="清理夸克浏览器/网盘缓存（包括视频缓存、常规 Cache）、下载的更新包及 AI 组件包。",
+            caution="建议先退出夸克；除常规缓存外，还将清理 updates 目录下的旧安装包和 QianwenInstaller 临时文件副本。",
             scanner=lambda: sum(
                 [
                     collect_children(HOME / "Library" / "Application Support" / "Quark" / "Cache"),
                     collect_children(HOME / "Library" / "Application Support" / "Quark" / "Quark" / "Cache"),
+                    collect_children(HOME / "Library" / "Application Support" / "Quark" / "updates"),
+                    collect_children(HOME / "Library" / "Application Support" / "Quark" / "QianwenInstaller"),
                 ],
                 [],
             ),
@@ -402,26 +588,45 @@ def build_items() -> List[CleanupItem]:
             key="package_manager_caches",
             level=2,
             title="开发工具缓存",
-            description="清理 pip / npm / pnpm / Homebrew / CocoaPods 等常见包管理缓存。",
-            caution="会让下次安装依赖时重新下载一部分文件。",
+            description="清理 pip / npm / pnpm / CocoaPods / Yarn / Bun 等开发包管理缓存。",
+            caution="会让下次安装依赖时重新下载一部分文件。注意：仅清理包下载缓存，不影响全局安装的 CLI 工具或认证配置。",
             scanner=lambda: sum(
                 [
                     collect_children(HOME / ".cache" / "pip"),
                     collect_children(HOME / ".npm"),
-                    collect_children(HOME / ".cargo"),
-                    collect_children(HOME / ".gradle"),
-                    collect_children(HOME / ".m2"),
-                    collect_children(HOME / "go" / "pkg"),
-                    collect_children(HOME / ".docker"),
+                    collect_children(HOME / ".cargo" / "registry" / "cache"),
+                    collect_children(HOME / ".cargo" / "registry" / "src"),
+                    collect_children(HOME / ".cargo" / "git" / "db"),
+                    collect_children(HOME / ".gradle" / "caches"),
+                    collect_children(HOME / ".m2" / "repository"),
+                    collect_children(HOME / "go" / "pkg" / "mod"),
                     collect_children(HOME / ".pnpm-store"),
                     collect_children(HOME / "Library" / "Caches" / "pnpm"),
-                    collect_children(HOME / "Library" / "Caches" / "Homebrew"),
                     collect_children(HOME / "Library" / "Caches" / "CocoaPods"),
                     collect_children(HOME / "Library" / "Caches" / "pip"),
                     collect_children(HOME / "Library" / "Caches" / "uv"),
+                    collect_children(HOME / "Library" / "Caches" / "Yarn"),
+                    collect_children(HOME / "Library" / "Caches" / "bun"),
+                    collect_children(HOME / "Library" / "Caches" / "deno"),
                 ],
                 [],
             ),
+        ),
+        CleanupItem(
+            key="homebrew_cleanup",
+            level=2,
+            title="Homebrew 官方深度清理",
+            description="运行 brew cleanup 和 brew autoremove 清理旧版本包、下载缓存及孤立无用依赖。",
+            caution="会清理不再需要的旧版本软件 and 未被使用的底层依赖包，安全性高，建议运行。",
+            scanner=collect_homebrew_cleanup,
+        ),
+        CleanupItem(
+            key="app_support_caches",
+            level=2,
+            title="应用支持目录隐藏缓存",
+            description="清理 ~/Library/Application Support/ 各应用子目录下的 Cache/GPUCache/Code Cache 等隐藏缓存文件夹。",
+            caution="很多应用将缓存保存在此处而非标准 Caches 目录，清理此项安全性高且能释放较多空间。",
+            scanner=collect_app_support_caches,
         ),
         CleanupItem(
             key="xcodebuildmcp_workspaces",
@@ -444,12 +649,12 @@ def build_items() -> List[CleanupItem]:
             ],
         ),
         CleanupItem(
-            key="codex_code_sign_clones",
+            key="code_sign_clones",
             level=3,
-            title="Codex 临时签名副本",
-            description="清理 Codex.app 在 /private/var/folders 下留下的 code_sign_clone 临时 App 副本。",
-            caution="建议先退出 Codex 再清理；如果 Codex 正在运行，跳过这一项更稳妥。",
-            scanner=collect_codex_code_sign_clones,
+            title="临时代码签名副本",
+            description="清理 Codex / Edge 等 Electron 软件在 /private/var/folders 下留下的 code_sign_clone 临时 App 副本。",
+            caution="建议先关闭相应 App 再清理；如果 App 正在运行，跳过这一项更稳妥。",
+            scanner=collect_code_sign_clones,
         ),
         CleanupItem(
             key="old_simulator_runtimes",
@@ -485,33 +690,41 @@ def build_items() -> List[CleanupItem]:
         CleanupItem(
             key="device_support",
             level=3,
-            title="Xcode 旧设备支持文件",
+            title="Xcode 旧设备 support 文件",
             description="清理 iOS DeviceSupport 目录中的旧版本支持文件。",
             caution="如果你还要连旧系统真机调试，请保留对应版本。",
             scanner=lambda: collect_children(HOME / "Library" / "Developer" / "Xcode" / "iOS DeviceSupport"),
         ),
         CleanupItem(
+            key="dictionary_sources",
+            level=3,
+            title="翻译/词典软件离线源文件",
+            description="清理翻译软件（如 Bob/Easydict）导入词典后残留在 source 目录下的原始 mdx/mdd 安装包副本。",
+            caution="仅清理源安装文件副本，不影响已经成功导入并使用的词典数据库。",
+            scanner=collect_dictionary_sources,
+        ),
+        CleanupItem(
             key="containers",
             level=3,
-            title="应用沙盒容器数据",
-            description="清理 ~/Library/Containers 下的沙盒应用数据。UUID目录常见离线视频、聊天文件等大体积内容。",
-            caution="包含应用的用户数据（如B站离线视频、微信文件），建议先进入目录确认内容再操作。",
-            scanner=lambda: collect_children(HOME / "Library" / "Containers"),
+            title="应用沙盒容器缓存",
+            description="清理 ~/Library/Containers 下各沙盒应用的 Caches 和 tmp 缓存文件夹。",
+            caution="仅清理各沙盒应用的临时缓存与临时文件，不影响应用配置和数据库等核心数据，安全性较高。",
+            scanner=lambda: collect_container_caches(HOME / "Library" / "Containers"),
         ),
         CleanupItem(
             key="group_containers",
             level=3,
-            title="应用组共享容器",
-            description="清理 ~/Library/Group Containers 下的应用与扩展共享数据。",
-            caution="应用主体与Widget/Extension共享的数据，清理可能影响扩展功能。",
-            scanner=lambda: collect_children(HOME / "Library" / "Group Containers"),
+            title="应用组共享容器缓存",
+            description="清理 ~/Library/Group Containers 下各共享组 of Caches 缓存与 Telegram 媒体缓存。",
+            caution="仅清理缓存文件（如 Telegram 离线图片/视频缓存），不删除账号配置与本地数据库，安全性较高。",
+            scanner=collect_group_container_caches,
         ),
         CleanupItem(
             key="app_support",
             level=3,
-            title="应用支持文件",
-            description="清理 ~/Library/Application Support 下的应用持久化数据。Chrome配置、Claude Desktop VM、飞书缓存等常很占空间。",
-            caution="包含浏览器配置、聊天记录等重要用户数据，强烈建议先确认内容。",
+            title="应用支持文件 (警告)",
+            description="清理 ~/Library/Application Support 下的应用持久化数据。包含 Chrome配置、飞书文件等。",
+            caution="【高危】这会直接删除整个应用的配置和数据文件夹（如浏览器配置、聊天记录等），强烈建议在进入目录确认后手动操作！",
             scanner=lambda: collect_children(HOME / "Library" / "Application Support"),
         ),
     ]
@@ -549,6 +762,7 @@ def print_summary(summary: Sequence[tuple[CleanupItem, List[Candidate], int]]) -
         )
         print(f"     {item.description}")
         print(f"     注意: {item.caution}")
+        print()
     print("-" * 90)
 
 
@@ -576,7 +790,8 @@ def ask_yes_no(prompt: str, default: bool = False) -> bool:
 
 def parse_selection(raw: str, limit: int) -> List[int]:
     result = set()
-    for chunk in raw.split(","):
+    normalized = raw.replace("[", "").replace("]", "")
+    for chunk in normalized.split(","):
         chunk = chunk.strip()
         if not chunk:
             continue
@@ -594,30 +809,16 @@ def parse_selection(raw: str, limit: int) -> List[int]:
     return sorted(result)
 
 
-def selective_delete(candidates: Sequence[Candidate]) -> tuple[int, int]:
-    """Let user pick specific items to delete from a candidate list."""
-    sorted_candidates = sorted(candidates, key=lambda c: c.size_bytes, reverse=True)
+def print_candidate_choices(candidates: Sequence[Candidate], limit: int | None = None) -> None:
+    visible_candidates = list(candidates if limit is None else candidates[:limit])
+    for i, candidate in enumerate(visible_candidates, start=1):
+        print(f"    [{i:02d}]  {human_size(candidate.size_bytes):>9}  {candidate_name(candidate)}")
+    if limit is not None and len(candidates) > limit:
+        print(f"    ... 还有 {len(candidates) - limit} 项，输入 l 查看全部")
 
-    print(f"\n  共 {len(sorted_candidates)} 项。输入编号选择（如 1,3,5-7），a=全选，q=返回：")
-    for i, c in enumerate(sorted_candidates, start=1):
-        print(f"    [{i:3d}]  {human_size(c.size_bytes):>9}  {candidate_name(c)}")
 
-    while True:
-        raw = input("  > ").strip().lower()
-        if raw in ("q", ""):
-            return 0, 0
-        if raw == "a":
-            indexes = list(range(1, len(sorted_candidates) + 1))
-            break
-        try:
-            indexes = parse_selection(raw, len(sorted_candidates))
-            if indexes:
-                break
-            print("  未匹配任何编号，请重试。")
-        except ValueError:
-            print("  格式不正确，请重试。")
-
-    selected = [sorted_candidates[i - 1] for i in indexes]
+def delete_specific_candidates(candidates: Sequence[Candidate], indexes: Sequence[int]) -> tuple[int, int]:
+    selected = [candidates[i - 1] for i in indexes]
     total_selected = sum(c.size_bytes for c in selected)
     print(f"  已选择 {len(selected)} 项，预计释放 {human_size(total_selected)}")
 
@@ -636,6 +837,28 @@ def selective_delete(candidates: Sequence[Candidate]) -> tuple[int, int]:
             print(f"  ! 删除失败: {candidate_display(candidate)} -> {exc}")
 
     return removed_count, removed_bytes
+
+
+def selective_delete(candidates: Sequence[Candidate]) -> tuple[int, int]:
+    """Let user pick specific items to delete from a candidate list."""
+    sorted_candidates = sorted(candidates, key=lambda c: c.size_bytes, reverse=True)
+
+    print("\n  全部候选项：")
+    print_candidate_choices(sorted_candidates)
+
+    while True:
+        raw = input("  输入编号（如 [01]、1,3、5-7），q=返回: ").strip().lower()
+        if raw in ("q", ""):
+            return 0, 0
+        try:
+            indexes = parse_selection(raw, len(sorted_candidates))
+            if indexes:
+                break
+            print("  未匹配任何编号，请重试。")
+        except ValueError:
+            print("  格式不正确，请重试。")
+
+    return delete_specific_candidates(sorted_candidates, indexes)
 
 
 def delete_candidates(item: CleanupItem, candidates: Sequence[Candidate]) -> tuple[int, int]:
@@ -663,24 +886,31 @@ def clean_selected(summary: Sequence[tuple[CleanupItem, List[Candidate], int]], 
 
         print(f"\n准备处理: {item.title}")
         print(f"预计可释放: {human_size(total)}，共 {len(candidates)} 项")
-        for candidate in top_candidates(candidates, limit=5):
-            print(f"  - {human_size(candidate.size_bytes):>9}  {candidate_display(candidate)}")
+        sorted_candidates = sorted(candidates, key=lambda c: c.size_bytes, reverse=True)
+        print_candidate_choices(sorted_candidates, limit=10)
 
-        print(f"\n请选择操作: [y=全部清理 / s=逐项选择 / n=跳过]")
+        print("\n请选择操作：直接回车=全部清理；输入编号=清理指定项；l=列出全部；n/q=跳过")
         skip_item = False
         while True:
             choice = input("  > ").strip().lower()
-            if choice in ("n", ""):
+            if choice in ("n", "q"):
                 print("  已跳过。")
                 skip_item = True
                 break
-            if choice == "y":
-                removed_count, removed_bytes = delete_candidates(item, candidates)
+            if choice in ("", "a", "all", "y"):
+                removed_count, removed_bytes = delete_candidates(item, sorted_candidates)
                 break
-            if choice == "s":
-                removed_count, removed_bytes = selective_delete(candidates)
+            if choice == "l":
+                print_candidate_choices(sorted_candidates)
+                continue
+            try:
+                indexes = parse_selection(choice, len(sorted_candidates))
+            except ValueError:
+                indexes = []
+            if indexes:
+                removed_count, removed_bytes = delete_specific_candidates(sorted_candidates, indexes)
                 break
-            print("  请输入 y / s / n。")
+            print("  请输编号、l、n，或直接回车。")
         if skip_item:
             continue
         total_removed_count += removed_count
@@ -692,33 +922,37 @@ def clean_selected(summary: Sequence[tuple[CleanupItem, List[Candidate], int]], 
     print(f"估算释放: {human_size(total_removed_bytes)}")
 
 
-def choose_items(summary: Sequence[tuple[CleanupItem, List[Candidate], int]]) -> List[int]:
+def choose_items(summary: Sequence[tuple[CleanupItem, List[Candidate], int]]) -> Optional[List[int]]:
     print(
         "\n选择清理方式:\n"
-        "  1. 只清理 L1 安全项\n"
-        "  2. 清理 L1 + L2\n"
-        "  3. 清理全部 L1 + L2 + L3\n"
-        "  4. 自定义选择编号\n"
-        "  5. 退出"
+        "  1. 选择 L1 项\n"
+        "  2. 选择 L2 项\n"
+        "  3. 选择 L3 项\n"
+        "  输入总览序号可选择特定项，例如 [01]、01、01,05、01-03\n"
+        "  q. 退出"
     )
     while True:
-        choice = input("请输入选项编号: ").strip()
+        choice = input("请输入选项编号或总览序号: ").strip().lower()
         if choice == "1":
-            return [i for i, (item, _, total) in enumerate(summary, start=1) if item.level <= 1 and total > 0]
+            return [i for i, (item, _, total) in enumerate(summary, start=1) if item.level == 1 and total > 0]
         if choice == "2":
-            return [i for i, (item, _, total) in enumerate(summary, start=1) if item.level <= 2 and total > 0]
+            return [i for i, (item, _, total) in enumerate(summary, start=1) if item.level == 2 and total > 0]
         if choice == "3":
-            return [i for i, (_, _, total) in enumerate(summary, start=1) if total > 0]
-        if choice == "4":
-            raw = input("输入编号，支持 1,3,5-7 这种格式: ").strip()
+            return [i for i, (item, _, total) in enumerate(summary, start=1) if item.level == 3 and total > 0]
+        if choice in {"q", "quit", "exit"}:
+            return None
+        if choice:
             try:
-                return parse_selection(raw, len(summary))
+                indexes = parse_selection(choice, len(summary))
             except ValueError:
                 print("编号格式不正确，请重试。")
                 continue
-        if choice == "5":
-            return []
-        print("请输入 1-5。")
+            indexes = [i for i in indexes if summary[i - 1][2] > 0]
+            if indexes:
+                return indexes
+            print("未匹配任何有内容的项目，请重试。")
+            continue
+        print("请输入 1 / 2 / 3、总览序号，或 q。")
 
 
 def ensure_macos() -> None:
@@ -761,12 +995,19 @@ def main() -> None:
         print("\n当前是 --scan-only 模式，未执行任何删除。")
         return
 
-    selected_indexes = choose_items(summary)
-    if not selected_indexes:
-        print("未选择任何项目，已退出。")
-        return
+    while True:
+        selected_indexes = choose_items(summary)
+        if selected_indexes is None:
+            print("已退出。")
+            return
+        if not selected_indexes:
+            print("当前选择没有可清理内容，请重新选择。")
+            continue
 
-    clean_selected(summary, selected_indexes)
+        clean_selected(summary, selected_indexes)
+        print("\n重新扫描，更新可清理项目总览...")
+        summary = summarize(items)
+        print_summary(summary)
 
 
 if __name__ == "__main__":
