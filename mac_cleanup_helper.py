@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+"""Interactive macOS cleanup helper with a two-layer, safety-first menu.
+
+The first layer is always the cleanup-category overview.  A category number opens
+its second-layer detail page; deletion requires an explicit ``c`` command so a
+plain number can never be mistaken for destructive input.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -19,6 +26,24 @@ from typing import Callable, Iterable, List, Optional, Sequence
 HOME = Path.home()
 NOW = time.time()
 DOWNLOAD_STALE_DAYS = 30
+XCODE_DERIVED_DATA_ROOT = HOME / "Library" / "Developer" / "Xcode" / "DerivedData"
+
+# Only these rebuildable paths are offered under the DerivedData cleanup item.
+# SourcePackages is deliberately absent: it contains Swift Package checkouts such
+# as GRDB and should not disappear during an ordinary build-cache cleanup.
+XCODE_GLOBAL_CACHE_TARGETS: dict[str, str] = {
+    "ModuleCache.noindex": "全局模块缓存",
+    "SDKStatCaches.noindex": "SDK 统计缓存",
+    "SymbolCache.noindex": "全局符号缓存",
+}
+XCODE_PROJECT_CACHE_TARGETS: dict[str, str] = {
+    "Build": "编译产物",
+    "Index.noindex": "代码索引",
+    "Logs": "构建日志",
+    "SymbolCache": "符号缓存",
+    "TextIndex": "文本索引",
+    "OpenQuickly-ReferencedFrameworks.index-v1": "快速打开索引",
+}
 
 TCC_PROTECTED: set[str] = {
     "familycircled",
@@ -47,7 +72,7 @@ class Candidate:
 @dataclass
 class CleanupItem:
     key: str
-    level: int
+    risk_level: int
     title: str
     description: str
     caution: str
@@ -326,6 +351,55 @@ def collect_xdg_caches() -> List[Candidate]:
     return collect_children(HOME / ".cache")
 
 
+def xcode_project_display_name(directory_name: str) -> str:
+    """Remove Xcode's trailing DerivedData hash from a project directory name."""
+    return re.sub(r"-[a-z]{20,32}$", "", directory_name) or directory_name
+
+
+def collect_xcode_derived_data_caches() -> List[Candidate]:
+    """Collect rebuildable DerivedData caches without touching SourcePackages.
+
+    Older versions of this script returned each project directory as one candidate.
+    Deleting that directory also deleted Swift Package source checkouts.  Keeping the
+    allow-list here narrow makes the scanner and the delete guard share one policy.
+    """
+    candidates: List[Candidate] = []
+    if not XCODE_DERIVED_DATA_ROOT.exists():
+        return candidates
+
+    for entry in safe_scandir(XCODE_DERIVED_DATA_ROOT):
+        path = Path(entry.path)
+
+        global_label = XCODE_GLOBAL_CACHE_TARGETS.get(path.name)
+        if global_label is not None:
+            candidates.append(
+                Candidate(
+                    path=path,
+                    size_bytes=path_size(path),
+                    label=f"{global_label} — {path}",
+                )
+            )
+            continue
+
+        if not path.is_dir() or path.is_symlink():
+            continue
+
+        project_name = xcode_project_display_name(path.name)
+        for target_name, target_label in XCODE_PROJECT_CACHE_TARGETS.items():
+            target = path / target_name
+            if not target.exists() and not target.is_symlink():
+                continue
+            candidates.append(
+                Candidate(
+                    path=target,
+                    size_bytes=path_size(target),
+                    label=f"{project_name} · {target_label} — {target}",
+                )
+            )
+
+    return candidates
+
+
 def collect_container_caches(root_dir: Path) -> List[Candidate]:
     candidates: List[Candidate] = []
     if not root_dir.exists():
@@ -521,12 +595,32 @@ def delete_path(path: Path) -> None:
         raise RuntimeError("删除后目标仍然存在，可能是权限不足或文件正在使用")
 
 
-def delete_candidate(candidate: Candidate) -> None:
+def validate_xcode_derived_data_target(path: Path) -> None:
+    """Reject broad or dependency-bearing DerivedData deletion targets."""
+    try:
+        relative = path.absolute().relative_to(XCODE_DERIVED_DATA_ROOT.absolute())
+    except ValueError as exc:
+        raise RuntimeError("Xcode 清理目标不在 DerivedData 目录内，已拒绝") from exc
+
+    parts = relative.parts
+    if not parts or "SourcePackages" in parts:
+        raise RuntimeError("SourcePackages/Swift Package 源码受保护，已拒绝删除")
+
+    if len(parts) == 1 and parts[0] in XCODE_GLOBAL_CACHE_TARGETS:
+        return
+    if len(parts) == 2 and parts[1] in XCODE_PROJECT_CACHE_TARGETS:
+        return
+    raise RuntimeError("该路径不是允许清理的 Xcode 编译缓存，已拒绝删除")
+
+
+def delete_candidate(candidate: Candidate, item: CleanupItem | None = None) -> None:
     if candidate.delete_command:
         result = subprocess.run(list(candidate.delete_command), text=True, check=False)
         if result.returncode != 0:
             raise RuntimeError(f"命令退出码 {result.returncode}: {' '.join(candidate.delete_command)}")
         return
+    if item is not None and item.key == "xcode_derived_data":
+        validate_xcode_derived_data_target(candidate.path)
     delete_path(candidate.path)
 
 
@@ -538,7 +632,7 @@ def build_items() -> List[CleanupItem]:
     return [
         CleanupItem(
             key="user_caches",
-            level=1,
+            risk_level=1,
             title="🧹 用户应用缓存",
             description="清理 ~/Library/Caches 下的大部分 App 缓存，通常可自动重建。",
             caution="安全性高，但首次重新打开某些 App 可能会稍慢。",
@@ -546,7 +640,7 @@ def build_items() -> List[CleanupItem]:
         ),
         CleanupItem(
             key="xdg_caches",
-            level=1,
+            risk_level=1,
             title="⚙️ XDG 用户缓存",
             description="清理 ~/.cache 下的各类命令行工具与开发框架缓存（如 HuggingFace 模型缓存等）。",
             caution="安全性较高，但部分 CLI 工具或 AI 框架下次运行会重新下载模型或依赖环境。",
@@ -554,7 +648,7 @@ def build_items() -> List[CleanupItem]:
         ),
         CleanupItem(
             key="user_logs",
-            level=1,
+            risk_level=1,
             title="📝 用户日志",
             description="清理 ~/Library/Logs 下的日志 and 崩溃报告。",
             caution="删除后不影响 App 使用，但会失去部分排错线索。",
@@ -562,7 +656,7 @@ def build_items() -> List[CleanupItem]:
         ),
         CleanupItem(
             key="quark_caches",
-            level=2,
+            risk_level=2,
             title="🌐 夸克缓存及残留",
             description="清理夸克浏览器/网盘缓存（包括视频缓存、常规 Cache）、下载的更新包及 AI 组件包。",
             caution="建议先退出夸克；除常规缓存外，还将清理 updates 目录下的旧安装包和 QianwenInstaller 临时文件副本。",
@@ -578,7 +672,7 @@ def build_items() -> List[CleanupItem]:
         ),
         CleanupItem(
             key="trash",
-            level=1,
+            risk_level=1,
             title="🗑️ 废纸篓",
             description="清空 ~/.Trash 里的内容。",
             caution="会永久删除废纸篓中的文件。",
@@ -586,15 +680,15 @@ def build_items() -> List[CleanupItem]:
         ),
         CleanupItem(
             key="xcode_derived_data",
-            level=2,
+            risk_level=2,
             title="🛠️ Xcode DerivedData",
-            description="清理 Xcode 编译缓存，常见且很占空间。",
-            caution="安全性较高，但下次编译会变慢。",
-            scanner=lambda: collect_children(HOME / "Library" / "Developer" / "Xcode" / "DerivedData"),
+            description="按项目清理 Build、索引、日志等可重建内容，不删除 Swift Package 源码。",
+            caution="下次编译和建立索引会变慢；SourcePackages（包括 GRDB checkout）始终保留。",
+            scanner=collect_xcode_derived_data_caches,
         ),
         CleanupItem(
             key="xcode_archives",
-            level=2,
+            risk_level=2,
             title="📦 Xcode Archives",
             description="清理旧归档包，适合不再需要的历史构建产物。",
             caution="如果你需要回滚某个旧归档，请别删对应版本。",
@@ -602,7 +696,7 @@ def build_items() -> List[CleanupItem]:
         ),
         CleanupItem(
             key="ios_simulator_caches",
-            level=2,
+            risk_level=2,
             title="📱 iOS Simulator 缓存",
             description="清理 CoreSimulator 的缓存目录。",
             caution="不会删掉模拟器设备本身，但部分缓存会重建。",
@@ -610,7 +704,7 @@ def build_items() -> List[CleanupItem]:
         ),
         CleanupItem(
             key="core_simulator_dyld_cache",
-            level=2,
+            risk_level=2,
             title="⚡ Simulator dyld 缓存",
             description="通过 simctl 清理所有 Simulator runtime 的 dyld shared cache。",
             caution="安全性较高，但下次启动/运行模拟器时会按需重建；可能需要 Xcode 命令行工具可用。",
@@ -618,7 +712,7 @@ def build_items() -> List[CleanupItem]:
         ),
         CleanupItem(
             key="unavailable_simulator_devices",
-            level=2,
+            risk_level=2,
             title="🚫 不可用模拟器设备",
             description="清理 simctl 标记为不可用的模拟器设备数据。",
             caution="只删除不可用设备；如果以后需要旧 runtime，可重新下载 runtime 后再创建设备。",
@@ -626,7 +720,7 @@ def build_items() -> List[CleanupItem]:
         ),
         CleanupItem(
             key="package_manager_caches",
-            level=2,
+            risk_level=2,
             title="👩‍💻 开发工具缓存",
             description="清理 pip / npm / pnpm / CocoaPods / Yarn / Bun 等开发包管理缓存。",
             caution="会让下次安装依赖时重新下载一部分文件。注意：仅清理包下载缓存，不影响全局安装的 CLI 工具或认证配置。",
@@ -655,7 +749,7 @@ def build_items() -> List[CleanupItem]:
         ),
         CleanupItem(
             key="arduino_caches",
-            level=2,
+            risk_level=2,
             title="🤖 Arduino IDE 下载缓存",
             description="清理 ~/Library/Arduino15/staging/ 下的开发板与库下载缓存。",
             caution="安全性高，不影响已安装的开发板和库，下次升级板卡或安装库时会重新下载包。",
@@ -663,7 +757,7 @@ def build_items() -> List[CleanupItem]:
         ),
         CleanupItem(
             key="homebrew_cleanup",
-            level=2,
+            risk_level=2,
             title="🍺 Homebrew 官方深度清理",
             description="运行 brew cleanup 和 brew autoremove 清理旧版本包、下载缓存及孤立无用依赖。",
             caution="会清理不再需要的旧版本软件 and 未被使用的底层依赖包，安全性高，建议运行。",
@@ -671,7 +765,7 @@ def build_items() -> List[CleanupItem]:
         ),
         CleanupItem(
             key="app_support_caches",
-            level=2,
+            risk_level=2,
             title="🔍 应用支持目录隐藏缓存",
             description="清理 ~/Library/Application Support/ 各应用子目录下的 Cache/GPUCache/Code Cache 等隐藏缓存文件夹。",
             caution="很多应用将缓存保存在此处而非标准 Caches 目录，清理此项安全性高且能释放较多空间。",
@@ -679,7 +773,7 @@ def build_items() -> List[CleanupItem]:
         ),
         CleanupItem(
             key="xcodebuildmcp_workspaces",
-            level=2,
+            risk_level=2,
             title="💻 XcodeBuildMCP 工作区缓存",
             description="清理 Codex / XcodeBuildMCP 的派生构建缓存。",
             caution="只影响后续重新构建速度。",
@@ -687,7 +781,7 @@ def build_items() -> List[CleanupItem]:
         ),
         CleanupItem(
             key="xctest_devices",
-            level=2,
+            risk_level=2,
             title="🧪 XCTest 临时设备",
             description="清理 Xcode/XCTest 生成的临时测试设备数据。",
             caution="会删除旧 UI 测试设备状态；需要时 Xcode 会重新创建。",
@@ -699,7 +793,7 @@ def build_items() -> List[CleanupItem]:
         ),
         CleanupItem(
             key="code_sign_clones",
-            level=3,
+            risk_level=3,
             title="🔑 临时代码签名副本",
             description="清理 Codex / Edge 等 Electron 软件在 /private/var/folders 下留下的 code_sign_clone 临时 App 副本。",
             caution="建议先关闭相应 App 再清理；如果 App 正在运行，跳过这一项更稳妥。",
@@ -707,7 +801,7 @@ def build_items() -> List[CleanupItem]:
         ),
         CleanupItem(
             key="old_simulator_runtimes",
-            level=3,
+            risk_level=3,
             title="⏳ 30天未使用的 Simulator runtime",
             description="通过 simctl 删除 30 天未使用的可删除 Simulator runtime。",
             caution="会删除旧 iOS/watchOS runtime；如果需要测试旧系统兼容，请逐项选择而不是全选。",
@@ -715,7 +809,7 @@ def build_items() -> List[CleanupItem]:
         ),
         CleanupItem(
             key="ios_simulator_erase",
-            level=3,
+            risk_level=3,
             title="📱 iOS Simulator 设备数据重置",
             description="通过 simctl erase all 重置所有 iOS 模拟器设备的内容和设置（相当于恢复出厂设置）。",
             caution="【中危】会删除模拟器内安装的所有 App 和测试数据，但不会删除模拟器本身。下次测试时需要重新跑/编译 App。",
@@ -723,7 +817,7 @@ def build_items() -> List[CleanupItem]:
         ),
         CleanupItem(
             key="downloads_installers",
-            level=3,
+            risk_level=3,
             title="📥 下载目录中的旧安装包",
             description=f"筛出 Downloads 中超过 {DOWNLOAD_STALE_DAYS} 天的 .dmg / .pkg / .zip / .xip / .iso。",
             caution="请确认这些安装包以后不再需要。",
@@ -735,7 +829,7 @@ def build_items() -> List[CleanupItem]:
         ),
         CleanupItem(
             key="ios_backups",
-            level=3,
+            risk_level=3,
             title="📲 iPhone / iPad 本地备份",
             description="清理 MobileSync 里的旧设备备份。",
             caution="删除后无法用本地备份恢复旧设备数据，请谨慎。",
@@ -746,7 +840,7 @@ def build_items() -> List[CleanupItem]:
         ),
         CleanupItem(
             key="device_support",
-            level=3,
+            risk_level=3,
             title="📂 Xcode 旧设备 support 文件",
             description="清理 iOS DeviceSupport 目录中的旧版本支持文件。",
             caution="如果你还要连旧系统真机调试，请保留对应版本。",
@@ -754,7 +848,7 @@ def build_items() -> List[CleanupItem]:
         ),
         CleanupItem(
             key="dictionary_sources",
-            level=3,
+            risk_level=3,
             title="📖 翻译/词典软件离线源文件",
             description="清理翻译软件（如 Bob/Easydict）导入词典后残留在 source 目录下的原始 mdx/mdd 安装包副本。",
             caution="仅清理源安装文件副本，不影响已经成功导入并使用的词典数据库。",
@@ -762,7 +856,7 @@ def build_items() -> List[CleanupItem]:
         ),
         CleanupItem(
             key="containers",
-            level=3,
+            risk_level=3,
             title="📦 应用沙盒容器缓存",
             description="清理 ~/Library/Containers 下各沙盒应用的 Caches 和 tmp 缓存文件夹。",
             caution="仅清理各沙盒应用的临时缓存与临时文件，不影响应用配置和数据库等核心数据，安全性较高。",
@@ -770,7 +864,7 @@ def build_items() -> List[CleanupItem]:
         ),
         CleanupItem(
             key="group_containers",
-            level=3,
+            risk_level=3,
             title="👥 应用组共享容器缓存",
             description="清理 ~/Library/Group Containers 下各共享组 of Caches 缓存与 Telegram 媒体缓存。",
             caution="仅清理缓存文件（如 Telegram 离线图片/视频缓存），不删除账号配置与本地数据库，安全性较高。",
@@ -778,7 +872,7 @@ def build_items() -> List[CleanupItem]:
         ),
         CleanupItem(
             key="app_support",
-            level=3,
+            risk_level=3,
             title="⚠️ 应用支持文件 (警告)",
             description="清理 ~/Library/Application Support 下的应用持久化数据。包含 Chrome配置、飞书文件等。",
             caution="【高危】这会直接删除整个应用的配置和数据文件夹（如浏览器配置、聊天记录等），强烈建议在进入目录确认后手动操作！",
@@ -808,58 +902,78 @@ def summarize(items: Sequence[CleanupItem]) -> list[tuple[CleanupItem, List[Cand
     return summary
 
 
-def print_level_1_summary(summary: Sequence[tuple[CleanupItem, List[Candidate], int]]) -> None:
-    print("\n==================== [层级 1] 可清理项目总览 ====================")
-    print("-" * 90)
+def print_overview(summary: Sequence[tuple[CleanupItem, List[Candidate], int]]) -> None:
+    """Print only the cleanup categories, matching the requested first layer."""
+    print("\n==================== [第一层] 可清理大项总览 ====================")
+    print("-" * 76)
     total_all_bytes = 0
     total_all_items = 0
     for index, (item, candidates, total) in enumerate(summary, start=1):
-        count = len(candidates)
         total_all_bytes += total
-        total_all_items += count
+        total_all_items += len(candidates)
         print(
-            f"{index:02d} 风险{item.level} | {item.title:<28} | "
-            f"{human_size(total):>9} | {count:>4} 项 | {item.key}"
+            f"{index:02d} {item.title:<30} "
+            f"{human_size(total):>10} | {len(candidates):>4} 项"
         )
-        print(f"     {item.description}")
-        print(f"     注意: {item.caution}")
-        print()
-    print("-" * 90)
+    print("-" * 76)
     print(f"📊 总计可清理: {human_size(total_all_bytes)} | 共 {total_all_items} 个子项")
     print("================================================================")
 
 
-def print_level_2_summary(summary: Sequence[tuple[CleanupItem, List[Candidate], int]]) -> None:
-    print("\n==================== [层级 2] 总览每个项目的全部子项 ====================")
-    has_content = False
-    for index, (item, candidates, total) in enumerate(summary, start=1):
-        if not candidates:
-            continue
-        has_content = True
-        print(f"\n{index:02d} {item.title} - {human_size(total)} (共 {len(candidates)} 项)")
-        sorted_candidates = sorted(candidates, key=lambda c: c.size_bytes, reverse=True)
-        for sub_idx, candidate in enumerate(sorted_candidates, start=1):
-            print(f"  - {index:02d}.{sub_idx:02d} {human_size(candidate.size_bytes):>9}  {candidate_display(candidate)}")
-    if not has_content:
-        print("\n✨ 所有项目均已清理干净，无任何子项！")
-    print("\n=======================================================================")
-
-
-def print_level_3_summary(summary: Sequence[tuple[CleanupItem, List[Candidate], int]], parent_idx: int) -> None:
-    print("\n==================== [层级 3] 单独父项下所有的子项 ====================")
-    item, candidates, total = summary[parent_idx]
-    print(f"📂 父项: {parent_idx + 1:02d} {item.title}")
-    print(f"   说明: {item.description}")
-    print(f"   注意: {item.caution}")
-    print(f"   总计: {human_size(total)} (共 {len(candidates)} 个子项)")
+def print_item_detail(
+    summary: Sequence[tuple[CleanupItem, List[Candidate], int]],
+    item_index: int,
+    *,
+    show_commands: bool = True,
+) -> None:
+    """Print one category's introduction and every child as the second layer."""
+    item, candidates, total = summary[item_index]
+    print("\n==================== [第二层] 大项详情 ====================")
+    print(f"📂 {item_index + 1:02d} {item.title}")
+    print(f"说明: {item.description}")
+    print(f"风险: {item.risk_level} / 3")
+    print(f"注意: {item.caution}")
+    print(f"合计: {human_size(total)} | {len(candidates)} 个子项")
     print("-" * 90)
     if not candidates:
-        print("   (当前项目下无任何可清理的子项)")
+        print("  （当前大项没有可清理的子项）")
     else:
-        sorted_candidates = sorted(candidates, key=lambda c: c.size_bytes, reverse=True)
-        for sub_idx, candidate in enumerate(sorted_candidates, start=1):
-            print(f"  - {sub_idx:02d} {human_size(candidate.size_bytes):>9}  {candidate_display(candidate)}")
-    print("=======================================================================")
+        for sub_index, candidate in enumerate(
+            sorted(candidates, key=lambda value: value.size_bytes, reverse=True),
+            start=1,
+        ):
+            print(
+                f"{sub_index:02d} {human_size(candidate.size_bytes):>10} | "
+                f"{candidate_display(candidate)}"
+            )
+    print("==========================================================")
+    if show_commands:
+        print_detail_commands()
+
+
+def print_all_item_details(
+    summary: Sequence[tuple[CleanupItem, List[Candidate], int]],
+) -> None:
+    """Batch report used only by --scan-only --details."""
+    for item_index in range(len(summary)):
+        print_item_detail(summary, item_index, show_commands=False)
+
+
+def print_overview_commands(item_count: int) -> None:
+    print("\n可用指令:")
+    print(f"  01-{item_count:02d}       输入大项序号，进入该大项的第二层详情")
+    print("  c 1,3,6-8   清理一个或多个完整大项（执行前仍会确认）")
+    print("  r           重新扫描")
+    print("  q           退出脚本")
+
+
+def print_detail_commands() -> None:
+    print("\n可用指令:")
+    print("  c 1,3,5-7   清理选中的子项")
+    print("  c all       清理当前大项的全部子项")
+    print("  b           返回第一层大项总览")
+    print("  r           重新扫描并刷新当前大项")
+    print("  q           退出脚本")
 
 
 def ask_yes_no(prompt: str, default: bool = False) -> bool:
@@ -876,7 +990,8 @@ def ask_yes_no(prompt: str, default: bool = False) -> bool:
 
 
 def parse_selection(raw: str, limit: int) -> List[int]:
-    result = set()
+    """Parse comma/range input and reject any out-of-range or reversed value."""
+    result: set[int] = set()
     normalized = raw.replace("[", "").replace("]", "")
     for chunk in normalized.split(","):
         chunk = chunk.strip()
@@ -886,109 +1001,29 @@ def parse_selection(raw: str, limit: int) -> List[int]:
             start_text, end_text = chunk.split("-", 1)
             start = int(start_text)
             end = int(end_text)
+            if start > end:
+                raise ValueError("范围起点不能大于终点")
             for number in range(start, end + 1):
-                if 1 <= number <= limit:
-                    result.add(number)
+                if not 1 <= number <= limit:
+                    raise ValueError(f"序号必须在 1-{limit} 之间")
+                result.add(number)
         else:
             number = int(chunk)
-            if 1 <= number <= limit:
-                result.add(number)
+            if not 1 <= number <= limit:
+                raise ValueError(f"序号必须在 1-{limit} 之间")
+            result.add(number)
     return sorted(result)
 
 
-def parse_mixed_selection(
-    raw: str, limit_categories: int, summary: Sequence[tuple[CleanupItem, List[Candidate], int]]
-) -> dict[int, list[int] | None]:
-    """
-    Parses selection string.
-    Returns a dict mapping 1-based category index to either:
-      - None (meaning delete the whole category)
-      - list[int] (1-based indices of sorted candidates to delete)
-    Raises ValueError on invalid formats.
-    """
-    selection: dict[int, list[int] | None] = {}
-    normalized = raw.replace("[", "").replace("]", "")
-    for chunk in normalized.split(","):
-        chunk = chunk.strip()
-        if not chunk:
-            continue
-        if "." in chunk:
-            # Sub-item selection or range, e.g., "17.1", "17.1-3", "17.1-17.3"
-            if "-" in chunk:
-                start_part, end_part = chunk.split("-", 1)
-                start_part = start_part.strip()
-                end_part = end_part.strip()
-
-                if "." not in start_part:
-                    raise ValueError("Invalid format")
-
-                start_cat_str, start_sub_str = start_part.split(".", 1)
-                start_cat = int(start_cat_str)
-                start_sub = int(start_sub_str)
-
-                if "." in end_part:
-                    end_cat_str, end_sub_str = end_part.split(".", 1)
-                    end_cat = int(end_cat_str)
-                    end_sub = int(end_sub_str)
-                else:
-                    end_cat = start_cat
-                    end_sub = int(end_part)
-
-                if start_cat != end_cat:
-                    raise ValueError("Cross-category ranges not supported")
-                if not (1 <= start_cat <= limit_categories):
-                    continue
-
-                _, candidates, _ = summary[start_cat - 1]
-                sorted_candidates = sorted(candidates, key=lambda c: c.size_bytes, reverse=True)
-                limit_sub = len(sorted_candidates)
-
-                if selection.get(start_cat) is not None:
-                    current_subs = selection[start_cat]
-                    for sub in range(start_sub, end_sub + 1):
-                        if 1 <= sub <= limit_sub:
-                            current_subs.append(sub)
-                elif start_cat not in selection:
-                    current_subs = []
-                    for sub in range(start_sub, end_sub + 1):
-                        if 1 <= sub <= limit_sub:
-                            current_subs.append(sub)
-                    selection[start_cat] = current_subs
-            else:
-                cat_str, sub_str = chunk.split(".", 1)
-                cat_idx = int(cat_str)
-                sub_idx = int(sub_str)
-                if not (1 <= cat_idx <= limit_categories):
-                    continue
-
-                _, candidates, _ = summary[cat_idx - 1]
-                sorted_candidates = sorted(candidates, key=lambda c: c.size_bytes, reverse=True)
-                limit_sub = len(sorted_candidates)
-
-                if 1 <= sub_idx <= limit_sub:
-                    if selection.get(cat_idx) is not None:
-                        selection[cat_idx].append(sub_idx)
-                    elif cat_idx not in selection:
-                        selection[cat_idx] = [sub_idx]
-        else:
-            # Whole category or category range, e.g., "17", "17-19"
-            if "-" in chunk:
-                start_text, end_text = chunk.split("-", 1)
-                start = int(start_text)
-                end = int(end_text)
-                for cat_idx in range(start, end + 1):
-                    if 1 <= cat_idx <= limit_categories:
-                        selection[cat_idx] = None
-            else:
-                cat_idx = int(chunk)
-                if 1 <= cat_idx <= limit_categories:
-                    selection[cat_idx] = None
-
-    for cat_idx, subs in selection.items():
-        if subs is not None:
-            selection[cat_idx] = sorted(list(set(subs)))
-
-    return selection
+def delete_command_argument(raw: str) -> str | None:
+    """Return a delete command's argument while keeping plain numbers navigational."""
+    for command in ("c", "clean", "d", "delete", "清理"):
+        if raw == command:
+            return ""
+        prefix = f"{command} "
+        if raw.startswith(prefix):
+            return raw[len(prefix):].strip()
+    return None
 
 
 def candidate_identity(candidate: Candidate) -> tuple[str, ...]:
@@ -1021,205 +1056,141 @@ def deduplicate_candidates(
     return unique
 
 
-def perform_deletion(
-    summary: Sequence[tuple[CleanupItem, List[Candidate], int]],
-    current_level: int,
-    selected_parent_idx: int
-) -> set[Path]:
-    deleted_paths: set[Path] = set()
+def execute_deletion(
+    candidates: Sequence[tuple[CleanupItem, Candidate]],
+    selected_lines: Sequence[str],
+) -> list[Candidate]:
+    """Confirm and execute one normalized deletion batch."""
+    unique_candidates = deduplicate_candidates(candidates)
+    if not unique_candidates:
+        print("⚠️ 选择的内容目前没有可清理子项。")
+        return []
 
-    if current_level == 1:
-        print("\n--- 执行层级 1 (项目总览) 删除操作 ---")
-        choice = input("请输入要清理的父项序号 (例如: 1 或 1,3 或 2-5，输入 'all' 清理全部，直接回车取消): ").strip().lower()
-        if not choice:
-            print("已取消删除操作。")
-            return deleted_paths
+    total_bytes = sum(candidate.size_bytes for _, candidate in unique_candidates)
+    selected_items = {item.key: item for item, _ in unique_candidates}
+    highest_risk = max(item.risk_level for item in selected_items.values())
 
-        if choice == "all":
-            indexes = list(range(1, len(summary) + 1))
-        else:
-            try:
-                indexes = parse_selection(choice, len(summary))
-            except ValueError:
-                print("⚠️ 序号格式不正确。")
-                return deleted_paths
+    print("\n🚀 准备清理:")
+    for line in selected_lines:
+        print(f"  - {line}")
+    print(f"预计可释放空间: {human_size(total_bytes)}")
+    for item in selected_items.values():
+        print(f"  注意 [{item.title}]: {item.caution}")
 
-        if not indexes:
-            print("⚠️ 未选择任何项目。")
-            return deleted_paths
+    if highest_risk >= 3:
+        confirmation = input("⚠️ 包含高风险内容，请输入 DELETE 确认，其他输入取消: ").strip()
+        if confirmation != "DELETE":
+            print("已取消清理。")
+            return []
+    elif not ask_yes_no("❓ 确认清理？", default=False):
+        print("已取消清理。")
+        return []
 
-        selected_items_info = []
-        total_bytes_to_delete = 0
-        candidates_to_delete = []
-
-        for idx in indexes:
-            item, candidates, total = summary[idx - 1]
-            if candidates:
-                selected_items_info.append(f"  - {idx:02d} {item.title} ({human_size(total)})")
-                total_bytes_to_delete += total
-                candidates_to_delete.extend((item, c) for c in candidates)
-
-        if not candidates_to_delete:
-            print("⚠️ 选择的项目中没有可清理的内容。")
-            return deleted_paths
-
-        candidates_to_delete = deduplicate_candidates(candidates_to_delete)
-        total_bytes_to_delete = sum(candidate.size_bytes for _, candidate in candidates_to_delete)
-
-        print(f"\n🚀 准备清理以下项目:")
-        for info in selected_items_info:
-            print(info)
-        print(f"预计可释放空间: {human_size(total_bytes_to_delete)}")
-
-        if not ask_yes_no("❓ 确认删除？", default=False):
-            print("已取消删除操作。")
-            return deleted_paths
-
-        removed_count = 0
-        removed_bytes = 0
-        for item, candidate in candidates_to_delete:
-            try:
-                size = candidate.size_bytes
-                delete_candidate(candidate)
-                removed_count += 1
-                removed_bytes += size
-                deleted_paths.add(candidate.path)
-            except Exception as exc:
-                print(f"  ❌ 删除失败: {candidate_display(candidate)} -> {exc}")
-
-        print(f"\n✨ 清理完成！已成功删除 {removed_count} 项，释放空间 {human_size(removed_bytes)}。")
-        input("\n按回车键继续...")
-        return deleted_paths
-
-    elif current_level == 2:
-        print("\n--- 执行层级 2 (全部子项总览) 删除操作 ---")
-        choice = input("请输入要删除的子项目序号 (例如: 1.1 或 1.1-3, 2.3，或者输入整数如 1 清空第1项的全部子项，直接回车取消): ").strip().lower()
-        if not choice:
-            print("已取消删除操作。")
-            return deleted_paths
-
+    removed_count = 0
+    removed_bytes = 0
+    removed_candidates: list[Candidate] = []
+    for item, candidate in unique_candidates:
         try:
-            selection = parse_mixed_selection(choice, len(summary), summary)
-        except ValueError:
-            print("⚠️ 序号格式不正确。")
-            return deleted_paths
+            delete_candidate(candidate, item)
+            removed_count += 1
+            removed_bytes += candidate.size_bytes
+            removed_candidates.append(candidate)
+        except Exception as exc:
+            print(f"  ❌ 清理失败: {candidate_display(candidate)} -> {exc}")
 
-        candidates_to_delete = []
-        total_bytes_to_delete = 0
-        selected_details = []
+    print(f"\n✨ 清理完成：成功 {removed_count} 项，释放 {human_size(removed_bytes)}。")
+    input("按回车键返回第一层总览...")
+    return removed_candidates
 
-        for cat_idx, subs in selection.items():
-            item, candidates, total = summary[cat_idx - 1]
-            if not candidates:
+
+def delete_overview_items(
+    summary: Sequence[tuple[CleanupItem, List[Candidate], int]],
+    selection_text: str,
+) -> list[Candidate]:
+    indexes = parse_selection(selection_text, len(summary))
+    candidates: list[tuple[CleanupItem, Candidate]] = []
+    selected_lines: list[str] = []
+    for index in indexes:
+        item, item_candidates, total = summary[index - 1]
+        selected_lines.append(f"{index:02d} {item.title}（{human_size(total)}）")
+        candidates.extend((item, candidate) for candidate in item_candidates)
+    return execute_deletion(candidates, selected_lines)
+
+
+def delete_detail_items(
+    summary: Sequence[tuple[CleanupItem, List[Candidate], int]],
+    item_index: int,
+    selection_text: str,
+) -> list[Candidate]:
+    item, candidates, _ = summary[item_index]
+    sorted_candidates = sorted(candidates, key=lambda value: value.size_bytes, reverse=True)
+    if not sorted_candidates:
+        print("⚠️ 当前大项没有可清理的子项。")
+        return []
+
+    indexes = (
+        list(range(1, len(sorted_candidates) + 1))
+        if selection_text == "all"
+        else parse_selection(selection_text, len(sorted_candidates))
+    )
+    selected_candidates = [(item, sorted_candidates[index - 1]) for index in indexes]
+    selected_lines = [
+        f"{index:02d} {candidate_name(sorted_candidates[index - 1])}"
+        f"（{human_size(sorted_candidates[index - 1].size_bytes)}）"
+        for index in indexes
+    ]
+    return execute_deletion(selected_candidates, selected_lines)
+
+
+def update_summary_after_deletion(
+    summary: Sequence[tuple[CleanupItem, List[Candidate], int]],
+    removed_candidates: Sequence[Candidate],
+) -> list[tuple[CleanupItem, List[Candidate], int]]:
+    """Update displayed totals from successful deletions without a full rescan.
+
+    Exact targets and descendants disappear from the summary.  If another cleanup
+    item contains one of the deleted paths, its cached size is reduced by the known
+    deleted size.  The explicit ``r`` command remains available for a fresh scan.
+    """
+    removed_identities = {candidate_identity(candidate) for candidate in removed_candidates}
+    removed_paths = [
+        (candidate.path.absolute(), candidate.size_bytes)
+        for candidate in removed_candidates
+        if not candidate.delete_command
+    ]
+    updated_summary: list[tuple[CleanupItem, List[Candidate], int]] = []
+
+    for item, candidates, _ in summary:
+        updated_candidates: list[Candidate] = []
+        for candidate in candidates:
+            if candidate_identity(candidate) in removed_identities:
                 continue
-            sorted_candidates = sorted(candidates, key=lambda c: c.size_bytes, reverse=True)
-            if subs is None:
-                selected_details.append(f"  - {cat_idx:02d} 整项: {item.title} ({human_size(total)})")
-                total_bytes_to_delete += total
-                candidates_to_delete.extend((item, c) for c in candidates)
-            else:
-                cat_subs_bytes = 0
-                sub_details = []
-                for sub_idx in subs:
-                    if 1 <= sub_idx <= len(sorted_candidates):
-                        c = sorted_candidates[sub_idx - 1]
-                        candidates_to_delete.append((item, c))
-                        cat_subs_bytes += c.size_bytes
-                        sub_details.append(f"    * {cat_idx:02d}.{sub_idx:02d} {candidate_name(c)} ({human_size(c.size_bytes)})")
-                if sub_details:
-                    selected_details.append(f"  - {cat_idx:02d} 部分子项 ({human_size(cat_subs_bytes)}):")
-                    selected_details.extend(sub_details)
-                    total_bytes_to_delete += cat_subs_bytes
+            if candidate.delete_command:
+                updated_candidates.append(candidate)
+                continue
 
-        if not candidates_to_delete:
-            print("⚠️ 未匹配任何可清理的内容。")
-            return deleted_paths
+            path = candidate.path.absolute()
+            if any(removed_path in path.parents for removed_path, _ in removed_paths):
+                continue
 
-        candidates_to_delete = deduplicate_candidates(candidates_to_delete)
-        total_bytes_to_delete = sum(candidate.size_bytes for _, candidate in candidates_to_delete)
+            nested_removed_size = sum(
+                removed_size
+                for removed_path, removed_size in removed_paths
+                if path in removed_path.parents
+            )
+            if nested_removed_size:
+                candidate = Candidate(
+                    path=candidate.path,
+                    size_bytes=max(0, candidate.size_bytes - nested_removed_size),
+                    label=candidate.label,
+                    delete_command=candidate.delete_command,
+                )
+            updated_candidates.append(candidate)
 
-        print("\n🚀 准备清理以下内容:")
-        for detail in selected_details:
-            print(detail)
-        print(f"预计可释放空间: {human_size(total_bytes_to_delete)}")
+        updated_total = sum(candidate.size_bytes for candidate in updated_candidates)
+        updated_summary.append((item, updated_candidates, updated_total))
 
-        if not ask_yes_no("❓ 确认删除？", default=False):
-            print("已取消删除操作。")
-            return deleted_paths
-
-        removed_count = 0
-        removed_bytes = 0
-        for item, candidate in candidates_to_delete:
-            try:
-                size = candidate.size_bytes
-                delete_candidate(candidate)
-                removed_count += 1
-                removed_bytes += size
-                deleted_paths.add(candidate.path)
-            except Exception as exc:
-                print(f"  ❌ 删除失败: {candidate_display(candidate)} -> {exc}")
-
-        print(f"\n✨ 清理完成！已成功删除 {removed_count} 项，释放空间 {human_size(removed_bytes)}。")
-        input("\n按回车键继续...")
-        return deleted_paths
-
-    elif current_level == 3:
-        print("\n--- 执行层级 3 (单独父项子项列表) 删除操作 ---")
-        item, candidates, total = summary[selected_parent_idx]
-        if not candidates:
-            print("⚠️ 该项目下没有可清理的子项。")
-            return deleted_paths
-
-        choice = input(f"请输入要删除的子项序号 (如: 1 或 1,3 或 2-5，输入 'all' 清理该项下所有子项，直接回车取消): ").strip().lower()
-        if not choice:
-            print("已取消删除操作。")
-            return deleted_paths
-
-        sorted_candidates = sorted(candidates, key=lambda c: c.size_bytes, reverse=True)
-
-        if choice == "all":
-            indexes = list(range(1, len(sorted_candidates) + 1))
-        else:
-            try:
-                indexes = parse_selection(choice, len(sorted_candidates))
-            except ValueError:
-                print("⚠️ 序号格式不正确。")
-                return deleted_paths
-
-        if not indexes:
-            print("⚠️ 未选择任何子项。")
-            return deleted_paths
-
-        selected_candidates = [sorted_candidates[idx - 1] for idx in indexes]
-        total_bytes_to_delete = sum(c.size_bytes for c in selected_candidates)
-
-        print(f"\n🚀 准备清理 [{item.title}] 的以下子项目:")
-        for idx in indexes:
-            c = sorted_candidates[idx - 1]
-            print(f"  - {idx:02d} {candidate_name(c)} ({human_size(c.size_bytes)})")
-        print(f"预计可释放空间: {human_size(total_bytes_to_delete)}")
-
-        if not ask_yes_no("❓ 确认删除这些子项目？", default=False):
-            print("已取消删除操作。")
-            return deleted_paths
-
-        removed_count = 0
-        removed_bytes = 0
-        for candidate in selected_candidates:
-            try:
-                size = candidate.size_bytes
-                delete_candidate(candidate)
-                removed_count += 1
-                removed_bytes += size
-                deleted_paths.add(candidate.path)
-            except Exception as exc:
-                print(f"  ❌ 删除失败: {candidate_display(candidate)} -> {exc}")
-
-        print(f"\n✨ 清理完成！已成功删除 {removed_count} 项，释放空间 {human_size(removed_bytes)}。")
-        input("\n按回车键继续...")
-        return deleted_paths
-
-    return deleted_paths
+    return updated_summary
 
 
 def ensure_macos() -> None:
@@ -1244,95 +1215,94 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def choose_parent(
-    summary: Sequence[tuple[CleanupItem, List[Candidate], int]],
-) -> int | None:
-    """Ask which parent project should be shown in level 3."""
-    print("\n请选择要查看的父项：")
-    for idx, (item, candidates, total) in enumerate(summary, start=1):
-        print(f"  {idx:02d} {item.title:<28} {human_size(total):>9} | {len(candidates):>4} 项")
-
-    while True:
-        raw = input(f"请输入父项序号 (1-{len(summary)})，直接回车返回: ").strip().lower()
-        if not raw or raw in {"b", "back"}:
-            return None
-        if raw in {"q", "quit", "exit"}:
-            raise SystemExit(0)
-        try:
-            parent_idx = int(raw) - 1
-        except ValueError:
-            print("⚠️ 请输入有效的父项序号。")
-            continue
-        if 0 <= parent_idx < len(summary):
-            return parent_idx
-        print(f"⚠️ 请输入 1 到 {len(summary)} 之间的数字。")
-
-
-def print_action_menu(current_level: int) -> None:
-    print(f"\n🛠️ 当前位于层级 {current_level}，可用指令:")
-    print("  1  可清理项目总览")
-    print("  2  每个项目的全部子项总览")
-    print("  3  查看一个父项下的全部子项")
-    print("  d  删除当前层级中选定的内容")
-    print("  q  退出脚本")
-
-
 def main() -> None:
     args = parse_args()
     ensure_macos()
 
     print("✨ macOS 手动清理助手 ✨")
-    print("💡 特点: 先扫描、分等级、分层级交互、逐项确认。")
+    print("💡 流程: 扫描 → 第一层大项总览 → 第二层子项详情 → 确认清理。")
 
     items = build_items()
     summary = summarize(items)
 
     if args.scan_only:
-        print_level_1_summary(summary)
+        print_overview(summary)
         if args.details:
-            print_level_2_summary(summary)
+            print_all_item_details(summary)
         print("\n当前是 --scan-only 模式，未执行任何删除。")
         return
 
-    current_level = 1
-    selected_parent_idx: int | None = None
+    # None means first layer; an index means that category's second layer.
+    selected_item_index: int | None = None
 
     while True:
-        if current_level == 1:
-            print_level_1_summary(summary)
-        elif current_level == 2:
-            print_level_2_summary(summary)
-        elif current_level == 3 and selected_parent_idx is not None:
-            print_level_3_summary(summary, selected_parent_idx)
+        if selected_item_index is None:
+            print_overview(summary)
+            print_overview_commands(len(summary))
+            choice = input("\n第一层请输入指令: ").strip().lower()
 
-        print_action_menu(current_level)
-        choice = input("\n请选择指令 [1/2/3/d/q]: ").strip().lower()
-
-        if choice == "1":
-            current_level = 1
-        elif choice == "2":
-            current_level = 2
-        elif choice == "3":
-            parent_idx = choose_parent(summary)
-            if parent_idx is not None:
-                selected_parent_idx = parent_idx
-                current_level = 3
-        elif choice == "d":
-            deleted_paths = perform_deletion(
-                summary,
-                current_level,
-                selected_parent_idx if selected_parent_idx is not None else 0,
-            )
-            if deleted_paths:
-                print("\n🔄 正在重新扫描，以磁盘上的实际结果更新总览...")
+            if choice in {"q", "quit", "exit"}:
+                print("已退出。")
+                return
+            if choice in {"r", "rescan", "刷新", "重新扫描"}:
+                print("\n🔄 正在重新扫描...")
                 summary = summarize(items)
-            current_level = 1
-            selected_parent_idx = None
-        elif choice in {"q", "quit", "exit"}:
+                continue
+
+            delete_argument = delete_command_argument(choice)
+            if delete_argument is not None:
+                if not delete_argument:
+                    print("⚠️ 请在 c 后写大项序号，例如：c 1,3,6-8")
+                    continue
+                try:
+                    removed_candidates = delete_overview_items(summary, delete_argument)
+                except ValueError as exc:
+                    print(f"⚠️ 清理序号无效：{exc}")
+                    continue
+                if removed_candidates:
+                    summary = update_summary_after_deletion(summary, removed_candidates)
+                continue
+
+            try:
+                item_number = int(choice)
+            except ValueError:
+                print("⚠️ 请输入大项序号，或使用 c / r / q 指令。")
+                continue
+            if not 1 <= item_number <= len(summary):
+                print(f"⚠️ 大项序号必须在 1-{len(summary)} 之间。")
+                continue
+            selected_item_index = item_number - 1
+            continue
+
+        print_item_detail(summary, selected_item_index)
+        choice = input("\n第二层请输入指令: ").strip().lower()
+
+        if choice in {"q", "quit", "exit"}:
             print("已退出。")
-            break
-        else:
-            print("⚠️ 未知指令，请重试。")
+            return
+        if choice in {"b", "back", "返回"}:
+            selected_item_index = None
+            continue
+        if choice in {"r", "rescan", "刷新", "重新扫描"}:
+            print("\n🔄 正在重新扫描...")
+            summary = summarize(items)
+            continue
+
+        delete_argument = delete_command_argument(choice)
+        if delete_argument is None:
+            print("⚠️ 第二层请使用 c 清理、b 返回、r 刷新或 q 退出。")
+            continue
+        if not delete_argument:
+            print("⚠️ 请在 c 后写子项序号，例如：c 1,3,5-7；或输入 c all。")
+            continue
+        try:
+            removed_candidates = delete_detail_items(summary, selected_item_index, delete_argument)
+        except ValueError as exc:
+            print(f"⚠️ 清理序号无效：{exc}")
+            continue
+        if removed_candidates:
+            summary = update_summary_after_deletion(summary, removed_candidates)
+            selected_item_index = None
 
 
 if __name__ == "__main__":
